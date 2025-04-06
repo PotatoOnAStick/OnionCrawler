@@ -12,6 +12,7 @@ import time
 import random
 import signal
 import concurrent.futures
+from collections import Counter
 
 # Configure the proxy for Tor
 TOR_PROXY = {
@@ -37,6 +38,45 @@ class SafeCounter:
         with self.lock:
             return self.value
 
+
+class SafeExtensionCounter:
+    def __init__(self):
+        self.extensions = {}
+        self.lock = threading.Lock()
+        
+    def increment(self, extension):
+        if not extension or extension == "no_extension":
+            return
+            
+        with self.lock:
+            if extension in self.extensions:
+                self.extensions[extension] += 1
+            else:
+                self.extensions[extension] = 1
+    
+    def get_all(self):
+        with self.lock:
+            return dict(self.extensions)
+    
+    def get_summary(self, top_n=10):
+        with self.lock:
+            total = sum(self.extensions.values())
+            if total == 0:
+                return {}
+                
+            # Get most common extensions
+            extensions_counter = Counter(self.extensions)
+            most_common = extensions_counter.most_common(top_n)
+            
+            # Calculate percentages
+            result = {}
+            for ext, count in most_common:
+                percentage = (count / total) * 100
+                result[ext] = (count, round(percentage, 2))
+                
+            return result
+
+
 class SafeSet:
     def __init__(self):
         self.items = set()
@@ -49,15 +89,16 @@ class SafeSet:
             self.items.add(item)
             return True
 
+
 class AtomicLogger:
     def __init__(self, success_file, error_file):
         self.success_file = success_file
         self.error_file = error_file
         self.file_lock = threading.Lock()
         
-    def log_success(self, url, files, dirs, status):
+    def log_success(self, url, files, dirs, extensions_summary, status):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_line = f"{timestamp} | {url} | Files: {files} | Directories: {dirs} | {status}\n"
+        log_line = f"{timestamp} | {url} | Files: {files} | Directories: {dirs} | Extensions: {extensions_summary} | {status}\n"
         with self.file_lock:
             with open(self.success_file, 'a', encoding='utf-8') as f:
                 f.write(log_line)
@@ -71,6 +112,7 @@ class AtomicLogger:
                 f.write(log_line)
                 f.flush()
 
+
 def is_directory_listing(html_content):
     """Check if the HTML is a directory listing page (Index of)."""
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -78,6 +120,7 @@ def is_directory_listing(html_content):
     h1_text = soup.h1.text.strip() if soup.h1 else ""
     
     return ("Index of" in title or "Index of" in h1_text)
+
 
 def normalize_url(url):
     if not url.startswith(('http://', 'https://')):
@@ -87,7 +130,27 @@ def normalize_url(url):
 
     return url
 
-def process_url(url, visited, files_counter, dirs_counter, max_depth, current_depth, work_queue, results):
+
+def get_file_extension(filename):
+    """Extract file extension from a filename."""
+    if not filename or filename.endswith('/'):
+        return None
+    
+    # Handle files without extensions
+    if '.' not in filename:
+        return "no_extension"
+        
+    # Get the extension (lowercase for consistency)
+    extension = filename.split('.')[-1].lower()
+    
+    # If the extension is too long, it might not be a real extension
+    if len(extension) > 10:
+        return "no_extension"
+        
+    return extension
+
+
+def process_url(url, visited, files_counter, dirs_counter, extension_counter, max_depth, current_depth, work_queue, results):
     """Process a single URL, counting files and adding directories to queue"""
     if GLOBAL_STOP_EVENT.is_set():
         return 0
@@ -104,7 +167,7 @@ def process_url(url, visited, files_counter, dirs_counter, max_depth, current_de
     try:
         # Acquire semaphore
         with TOR_RATE_LIMITER:
-            #  Add jitter to prevent THUNDERING HERD which was also my nickname in college
+            #  Add jitter to prevent THUNDERING HERD
             time.sleep(random.uniform(0.1, 0.5))
             
             timeout = 15 + random.uniform(0, 5)
@@ -150,6 +213,11 @@ def process_url(url, visited, files_counter, dirs_counter, max_depth, current_de
             else:
                 local_files += 1
                 files_counter.increment()  # Increment global counter
+                
+                # Extract and count file extension
+                extension = get_file_extension(link)
+                if extension:
+                    extension_counter.increment(extension)
         
         # Store success result
         results[url] = f"Success (found {local_files} files, {local_dirs} dirs at depth {current_depth})"
@@ -162,21 +230,124 @@ def process_url(url, visited, files_counter, dirs_counter, max_depth, current_de
     except Exception as e:
         results[url] = f"Error: {str(e)}"
     
-    return 0 
+    return 0
 
-def worker(work_queue, visited, files_counter, dirs_counter, max_depth, results, stop_event, worker_id):
+
+class WorkerPool:
+    """A pool of worker threads that can be dynamically adjusted"""
+    
+    def __init__(self, max_workers, target_func, worker_args):
+        self.max_workers = max_workers
+        self.target_func = target_func
+        self.worker_args = worker_args
+        self.workers = []
+        self.active_workers = 0
+        self.stop_event = threading.Event()
+        self.pool_lock = threading.Lock()
+        self.adjust_event = threading.Event()
+        
+    def start(self, initial_workers=1):
+        """Start the worker pool with initial_workers"""
+        with self.pool_lock:
+            for i in range(initial_workers):
+                self._add_worker()
+                
+            # Start monitoring thread
+            self.monitor_thread = threading.Thread(target=self._monitor_workers)
+            self.monitor_thread.daemon = True
+            self.monitor_thread.start()
+    
+    def _add_worker(self):
+        """Add a new worker to the pool"""
+        worker_id = len(self.workers)
+        thread = threading.Thread(
+            target=self.target_func,
+            args=self.worker_args + (self.stop_event, worker_id)
+        )
+        thread.daemon = True
+        thread.start()
+        self.workers.append(thread)
+        self.active_workers += 1
+        return thread
+        
+    def _monitor_workers(self):
+        """Monitor thread that maintains the pool at optimal size"""
+        while not self.stop_event.is_set() and not GLOBAL_STOP_EVENT.is_set():
+            # Wait for adjust signal or timeout
+            self.adjust_event.wait(timeout=2)
+            self.adjust_event.clear()
+            
+            with self.pool_lock:
+                # Remove dead workers from the list
+                active_count = sum(1 for w in self.workers if w.is_alive())
+                
+                # If we have fewer active workers than our count suggests, adjust
+                if active_count < self.active_workers:
+                    self.active_workers = active_count
+                
+                # Add new workers if we're below max and have work to do
+                work_queue = self.worker_args[0]  # Assuming work_queue is first arg
+                if (self.active_workers < self.max_workers and 
+                        not work_queue.empty()):
+                    # Add workers based on queue size
+                    try:
+                        queue_size = work_queue.qsize()
+                        workers_to_add = min(
+                            max(1, min(queue_size // 2, 3)),  # Add 1-3 based on queue size
+                            self.max_workers - self.active_workers  # Don't exceed max
+                        )
+                        
+                        for _ in range(workers_to_add):
+                            self._add_worker()
+                            
+                        if workers_to_add > 0:
+                            print(f"Added {workers_to_add} workers (total active: {self.active_workers})")
+                    except Exception as e:
+                        print(f"Error adding workers: {e}")
+            
+            # Sleep to prevent excessive checking
+            time.sleep(0.5)
+    
+    def signal_adjustment_needed(self):
+        """Signal that pool adjustment might be needed"""
+        self.adjust_event.set()
+        
+    def get_active_count(self):
+        """Get count of active workers"""
+        with self.pool_lock:
+            return self.active_workers
+            
+    def shutdown(self, wait=True):
+        """Shutdown the worker pool"""
+        self.stop_event.set()
+        if wait:
+            for worker in self.workers:
+                worker.join(timeout=2)
+        self.active_workers = 0
+
+
+def worker_function(work_queue, visited, files_counter, dirs_counter, extension_counter, max_depth, results, stop_event, worker_id):
     """Worker thread that processes URLs from the queue."""
     while not stop_event.is_set() and not GLOBAL_STOP_EVENT.is_set():
         try:
             # Get a URL from the queue with timeout
             try:
-                url, depth = work_queue.get(timeout=2)
+                url, depth = work_queue.get(timeout=1)
             except queue.Empty:
-                # take a
-                break
+                # No work available, signal potential adjustment
+                if 'pool' in globals():
+                    pool.signal_adjustment_needed()
+                continue
                 
             try:
-                process_url(url, visited, files_counter, dirs_counter, max_depth, depth, work_queue, results)
+                dirs_found = process_url(url, visited, files_counter, dirs_counter, 
+                                       extension_counter, max_depth, depth, 
+                                       work_queue, results)
+                                       
+                # If we found directories, might need more workers
+                if dirs_found > 0 and 'pool' in globals():
+                    pool.signal_adjustment_needed()
+                    
             except Exception as e:
                 print(f"Error processing {url}: {e}")
             finally:
@@ -186,23 +357,24 @@ def worker(work_queue, visited, files_counter, dirs_counter, max_depth, results,
         except Exception as e:
             print(f"Worker {worker_id} error: {e}")
 
+
 class DynamicCrawler:
     """Crawler class that dynamically adjusts the number of worker threads."""
     def __init__(self, max_workers, max_depth):
         self.max_workers = max_workers
         self.max_depth = max_depth
-        self.active_workers = 0
-        self.worker_lock = threading.Lock()
         
     def crawl_site(self, start_url, logger):
-        start_url = normalize_url(start_url)
+        global pool  # Make pool accessible to worker functions
         
+        start_url = normalize_url(start_url)
         print(f"Starting crawl of {start_url}...")
         
         # Initialize data
         visited = SafeSet()
         files_counter = SafeCounter(0)
         dirs_counter = SafeCounter(0)
+        extension_counter = SafeExtensionCounter()
         results = {}  # Store status msg for each URL
         
         work_queue = queue.Queue()
@@ -210,21 +382,14 @@ class DynamicCrawler:
         # Add the initial URL to the queue
         work_queue.put((start_url, 0))  # (url, depth)
         
-        # Event for coordination
-        dirs_found_event = threading.Event()
-        stop_event = threading.Event()
-        
-        # Start with the initial worker
-        initial_worker_thread = threading.Thread(
-            target=self.initial_worker,
-            args=(work_queue, visited, files_counter, dirs_counter, 
-                 self.max_depth, results, stop_event, dirs_found_event, 0)
+        # Create and start the worker pool
+        pool = WorkerPool(
+            max_workers=self.max_workers,
+            target_func=worker_function,
+            worker_args=(work_queue, visited, files_counter, dirs_counter, 
+                        extension_counter, self.max_depth, results)
         )
-        initial_worker_thread.daemon = True
-        initial_worker_thread.start()
-        
-        active_workers = [initial_worker_thread]
-        self.active_workers = 1
+        pool.start(initial_workers=1)
         
         try:
             start_time = time.time()
@@ -233,46 +398,17 @@ class DynamicCrawler:
             last_dirs = 0
             stalled_count = 0
             
-            while ((not work_queue.empty() or any(t.is_alive() for t in active_workers)) 
+            while ((not work_queue.empty() or pool.get_active_count() > 0) 
                   and (time.time() - start_time) < 600  # 10-minute timeout
                   and not GLOBAL_STOP_EVENT.is_set()):
                 
-                # Check if we need to add more workers
-                if dirs_found_event.is_set() and len(active_workers) < self.max_workers:
-                    dirs_found_event.clear()  # Reset the event
-                    
-                    # Calculate how many more workers to add
-                    with self.worker_lock:
-                        queue_size = work_queue.qsize() if hasattr(work_queue, 'qsize') else 3
-                        # Add workers proportionally to queue size, don't exceed max_workers
-                        workers_to_add = min(
-                            max(1, queue_size // 3),  # At least one, more for bigger queues
-                            self.max_workers - len(active_workers)  # Don't exceed max
-                        )
-                        
-                        # Add new workers
-                        for i in range(workers_to_add):
-                            worker_id = len(active_workers)
-                            worker_thread = threading.Thread(
-                                target=worker,
-                                args=(work_queue, visited, files_counter, 
-                                     dirs_counter, self.max_depth, results, 
-                                     stop_event, worker_id)
-                            )
-                            worker_thread.daemon = True
-                            worker_thread.start()
-                            active_workers.append(worker_thread)
-                            self.active_workers += 1
-                            
-                        print(f"Added {workers_to_add} workers (total: {len(active_workers)})")
-                
-                # Status reporting
-                curr_workers = sum(1 for t in active_workers if t.is_alive())
+                # Status reporting 
+                active_workers = pool.get_active_count()
                 queue_size = work_queue.qsize() if hasattr(work_queue, 'qsize') else "unknown"
                 files = files_counter.get()
                 dirs = dirs_counter.get()
                 
-                print(f"\r{start_url}: Workers: {curr_workers}/{self.max_workers}, Queue: {queue_size}, Files: {files}, Dirs: {dirs}", end="")
+                print(f"\r{start_url}: Workers: {active_workers}/{self.max_workers}, Queue: {queue_size}, Files: {files}, Dirs: {dirs}", end="")
                 
                 # Check if we're making progress
                 current_time = time.time()
@@ -294,61 +430,42 @@ class DynamicCrawler:
                 time.sleep(1)
                 
                 # If the queue is empty and no active threads, we're likely done
-                if work_queue.empty() and not any(t.is_alive() for t in active_workers):
+                if work_queue.empty() and pool.get_active_count() == 0:
                     break
                     
         except KeyboardInterrupt:
             print("\nCrawling interrupted by user. Cleaning up...")
             GLOBAL_STOP_EVENT.set()
-            stop_event.set()
         finally:
-            # Signal workers to stop
-            stop_event.set()
-            
-            # Wait for threads 
-            for t in active_workers:
-                t.join(timeout=2)
-            
-            # Update active workers count
-            with self.worker_lock:
-                self.active_workers = 0
+            # Shutdown the worker pool
+            pool.shutdown()
             
             print("\nCrawl completed.")
         
         # Get final results
         final_files = files_counter.get()
         final_dirs = dirs_counter.get()
+        extensions_summary = extension_counter.get_summary(top_n=10)
         status = "Interrupted" if GLOBAL_STOP_EVENT.is_set() else "Completed"
-        logger.log_success(start_url, final_files, final_dirs, status)
+        
+        # Format extensions summary for logging
+        ext_log_str = format_extensions_summary(extensions_summary)
+        logger.log_success(start_url, final_files, final_dirs, ext_log_str, status)
 
-        return final_files, final_dirs, status
+        return final_files, final_dirs, extensions_summary, status
+
+
+def format_extensions_summary(extensions_summary):
+    """Format extensions summary for logging and display."""
+    if not extensions_summary:
+        return "No files with extensions found"
     
-    def initial_worker(self, work_queue, visited, files_counter, dirs_counter, max_depth, results, stop_event, dirs_found_event, worker_id):
-        """First worker thread that signals when directories are found."""
-        while not stop_event.is_set() and not GLOBAL_STOP_EVENT.is_set():
-            try:
-                # Get a URL from queue
-                try:
-                    url, depth = work_queue.get(timeout=2)
-                except queue.Empty:
-                    break
-                    
-                try:
-                    # Process the URL and check if it had directories
-                    local_dirs = process_url(url, visited, files_counter, dirs_counter, max_depth, depth, work_queue, results)
-                    
-                    # Signal findings (needs more workers)
-                    if local_dirs and local_dirs > 0:
-                        dirs_found_event.set()
-                        
-                except Exception as e:
-                    print(f"Error in initial worker: {e}")
-                finally:
-                    # Always mark task as done
-                    work_queue.task_done()
-                    
-            except Exception as e:
-                print(f"Initial worker {worker_id} error: {e}")
+    parts = []
+    for ext, (count, percentage) in extensions_summary.items():
+        parts.append(f"{ext}:{count}({percentage}%)")
+    
+    return ", ".join(parts)
+
 
 def process_site(url, max_depth, max_workers, logger):
     """Process a single onion site and log results."""
@@ -362,37 +479,54 @@ def process_site(url, max_depth, max_workers, logger):
         crawler = DynamicCrawler(max_workers, max_depth)
         
         # Crawl the site
-        files, dirs, status = crawler.crawl_site(url, logger)
+        files, dirs, extensions_summary, status = crawler.crawl_site(url, logger)
+        
+        # Calculate files without extensions
+        extensions_total = sum(count for _, (count, _) in extensions_summary.items())
+        files_without_ext = files - extensions_total
         
         # Print summary
         print(f"\nCrawl summary for {url}:")
         print(f"Total files: {files}")
+        print(f"Files without extensions: {files_without_ext}")
         print(f"Total directories: {dirs}")
         print(f"Status: {status}")
+        
+        # Print extension statistics
+        print("File extensions breakdown:")
+        if extensions_summary:
+            for ext, (count, percentage) in extensions_summary.items():
+                print(f"  {ext}: {count} files ({percentage}%)")
+        else:
+            print("  No files with extensions found")
         
         return True
     except Exception as e:
         logger.log_error(url, f"Fatal error: {str(e)}")
         return False
 
+
 def process_site_wrapper(args):
     """Wrapper function for processing a site to be used with ThreadPoolExecutor."""
     url, max_depth, max_workers, logger = args
     return process_site(url, max_depth, max_workers, logger)
+
 
 def signal_handler(sig, frame):
     print("\nReceived shutdown signal, cleaning up...")
     GLOBAL_STOP_EVENT.set()
     sys.exit(0)
 
+
 def get_unique_filename(base_filename):
     """Generate a unique filename if base filename doesn't exists"""
     if not os.path.exists(base_filename):
         # Create the file with headers
         with open(base_filename, 'w', encoding='utf-8') as f:
-            f.write("Timestamp | URL | Files | Directories | Status\n")
-            f.write("-" * 80 + "\n")
+            f.write("Timestamp | URL | Files | Directories | Extensions | Status\n")
+            f.write("-" * 100 + "\n")
     return base_filename
+
 
 def check_tor_connection():
     """Check if the Tor connection is working."""
@@ -408,12 +542,13 @@ def check_tor_connection():
         print(f"Error connecting to Tor: {e}")
         return False
 
+
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     parser = argparse.ArgumentParser(description='Iteravely count files and directories from an onion link', 
-                               usage='%(prog)s [-h] [-i INPUT_FILE] [-d MAX_DEPTH] [-w MAX_WORKERS] [-p PARALLEL_SITES] [-c CONNECTIONS] [-o OUTPUT] [-e ERRORS] [urls ...]')
+                               usage='%(prog)s [-h] [-i INPUT_FILE] [-d MAX_DEPTH] [-w MAX_WORKERS] [-p PARALLEL_SITES] [-c CONNECTIONS] [-o OUTPUT] [-e ERRORS] urls ...')
     parser.add_argument('urls', nargs='*', help='Onion URLs to crawl')
     parser.add_argument('-i', '--input-file', help='File containing URLs')
     parser.add_argument('-d', '--max-depth', type=int, default=5, help='Maximum recursion depth (default: 5)')
@@ -478,6 +613,7 @@ def main():
                 print(f"Exception while crawling {url}: {e}")
 
     print(f"\nOperation completed. Results in {success_file}, errors in {error_file}")
+
 
 if __name__ == "__main__":
     main()
