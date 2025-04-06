@@ -24,9 +24,7 @@ A multi-threaded directory indexing tool for scanning and cataloging open direct
 # Install required packages
 pip install requests beautifulsoup4 pysocks
 
-# Make sure Tor is running
-# On Linux/Mac: service tor start
-# On Windows: Start the Tor Browser to run the Tor service
+# Make sure Tor is running on the correct port
 ```
 
 ## Usage
@@ -81,6 +79,6 @@ This tool is designed for research, archival, and legitimate security assessment
 
 - Respect website terms of service
 - Consider the load your crawling places on services.
-- Just don't do illegal shit
+- Just don't do illegal shit.
 
 MIT License or whatever
