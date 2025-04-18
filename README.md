@@ -1,84 +1,101 @@
-# Tor Directory Listing Crawler
+# Onion Directory Crawler
 
-A multi-threaded directory indexing tool for scanning and cataloging open directory listings on Tor onion services. This tool enables efficient discovery and analysis of content across the Tor network by identifying open directories and creating detailed reports of their contents.
+This tool crawls `.onion` websites accessible via the Tor network, specifically looking for open directory listings. It identifies files and subdirectories, counts them, analyzes file extensions, and stores the results in a local SQLite database. A separate command-line tool allows interaction with the stored data.
+
+This was created mostly as a programming exercise that went a bit out of hand. Hopefully it will make some security researchers days just a little bit easier.
 
 ## Features
-- **Multi-level Directory Scanning**: Recursively indexes discovered directories to a configurable depth
-- **Adaptive Threading**: Dynamically adjusts worker threads based on workload
-- **Parallel Site Processing**: Crawl multiple onion sites simultaneously
-- **Comprehensive Reporting**: Create an automated overview of the filetypes that can be found on a server
-- **Connection Management**: Configurable rate limiting to prevent Tor network overload
+
+*   **Concurrent Crawling:** Crawls multiple sites simultaneously and uses multiple threads per site for faster processing.
+*   **Rate Limiting:** Configurable global limit on concurrent Tor connections.
+*   **Database Storage:** Crawl summaries, status, file/directory counts, and extension statistics are stored in an SQLite database (`crawl_data.db` by default).
+*   **Optional Item Logging:** Can store the full paths of discovered files and directories in the database (`--log-items`).
 
 ## Requirements
 
-- Python 3.6+
-- Tor service running locally (typically on port 9050)
-- Required Python packages:
-  - requests
-  - beautifulsoup4
-  - PySocks
+*   Python 3.x
+*   Tor service running (usually listening on `127.0.0.1:9050`)
+*   Python libraries: `requests`, `beautifulsoup4`, `pysocks` (for SOCKS proxy support in `requests`)
 
 ## Installation
 
-```bash
-# Install required packages
-pip install requests beautifulsoup4 pysocks
-
-# Make sure Tor is running on the correct port
-```
+1.  **Clone or Download:** Get the project files.
+2.  **Install Dependencies:**
+    pip install requests beautifulsoup4 pysocks
+3.  **Ensure Tor is Running:** Start your Tor service.
 
 ## Usage
 
-```bash
-python tor_crawler.py [-h] [-i INPUT_FILE] [-d MAX_DEPTH] [-w MAX_WORKERS] 
-                      [-p PARALLEL_SITES] [-c CONNECTIONS] [-o OUTPUT] 
-                      [-e ERRORS] urls ...
-```
+The project consists of two main parts: the crawler and the database tool. Run commands from the directory *above* the `onion_crawler` package directory.
 
-### Arguments
+### 1. Running the Crawler (`scan.py`)
 
-- `urls`: Space-separated list of onion URLs to crawl
-- `-i, --input-file`: File containing URLs to crawl (one per line)
-- `-d, --max-depth`: Maximum recursion depth (default: 5)
-- `-w, --max-workers`: Maximum worker threads per site (default: 10)
-- `-p, --parallel-sites`: Number of sites to crawl in parallel (default: 5)
-- `-c, --connections`: Maximum concurrent Tor connections (default: 100)
-- `-o, --output`: Success output file (default: results.txt)
-- `-e, --errors`: Error output file (default: errors.txt)
+Use `python -m onion_crawler.scan` to start crawling.
 
-### Examples
+**Basic Examples:**
 
-```bash
-# Crawl a single onion site
-python tor_crawler.py http://abcdefghijklmnop.onion/
+*   Crawl a single URL:
+    python -m onion_crawler.scan http://example.onion
+*   Crawl multiple URLs:
+    python -m onion_crawler.scan http://onion1.onion http://onion2.onion
+*   Crawl URLs from a file (one URL per line, '#' comments ignored):
+    python -m onion_crawler.scan -i urls.txt
+    
 
-# Crawl multiple sites from a file with custom settings
-python tor_crawler.py -i onion_list.txt -d 3 -w 15 -p 3 -c 50
-```
+**Common Options:**
 
-## Output
+*   `-d, --max-depth N`: Set maximum crawl depth (default: 5).
+*   `-w, --max-workers N`: Max worker threads per site (default: 10).
+*   `-p, --parallel-sites N`: Number of sites to crawl concurrently (default: 5).
+*   `-c, --connections N`: Max concurrent Tor connections (global limit, default: 200).
+*   `--log-items`: Store individual file/directory paths found in the database. (Increases DB size significantly).
+*   `--db-file PATH`: Specify a different database file path.
+*   `--silent`: Suppress most console output.
 
-The tool generates two log files:
+Example with options:
+python -m onion_crawler.scan -i sites_to_scan.txt -p 10 -w 15 --log-items
 
-1. **Success log** (default: results.txt): Records successful crawls with:
-   - Timestamp
-   - URL
-   - Number of files found
-   - Number of directories found
-   - File extension statistics
-   - Crawl status
+2. Using the Database Tool (db.py)
+Use python -m onion_crawler.db to interact with the data stored by the crawler.
 
-2. **Error log** (default: errors.txt): Records failed crawls with:
-   - Timestamp
-   - URL
-   - Error details
+Commands:
 
-## Safety and Ethics
+list: Show a summary list of crawl records.
+--status STATUS[,STATUS...]: Filter by status (e.g., Completed, Timeout).
+--limit N: Limit number of results.
+--sort COLUMN: Sort by id, url, start_time, etc.
+--asc: Sort ascending.
+--url-like PATTERN: Filter URLs containing pattern.
+bash
+python -m onion_crawler.db list --status Completed --limit 20 --sort total_files
+show: Display detailed information for a single crawl.
+--id ID: Show details for a specific crawl ID.
+--url URL: Show details for a specific URL.
+bash
+python -m onion_crawler.db show --id 42
+python -m onion_crawler.db show --url http://example.onion/
+summary: Show overall statistics from the database (total crawls, status breakdown, average duration, etc.).
+bash
+python -m onion_crawler.db summary
+top-extensions: Show aggregated file extension counts across crawls.
+--top N: Show top N extensions.
+--min-count N: Minimum count for an extension to be included.
+bash
+python -m onion_crawler.db top-extensions --top 15
+show-items: List individual files/directories logged for a crawl (requires --log-items during crawl).
+--id ID or --url URL: Specify the crawl.
+--type [file|directory]: Filter by item type.
+--limit N: Limit number of items shown.
+bash
+python -m onion_crawler.db show-items --id 42 --type file --limit 100
+Common Options (for DB Tool):
 
-This tool is designed for research, archival, and legitimate security assessment purposes. Please use responsibly and in accordance with applicable laws and regulations. Always:
+--db-file PATH: Specify the database file to query.
+--silent: Suppress output.
+Database
+Crawl results are stored in an SQLite database file (default: crawl_data.db).
 
-- Respect website terms of service
-- Consider the load your crawling places on services.
-- Just don't do illegal shit.
-
-MIT License or whatever
+crawls: Main table storing summary information for each site crawled (URL, status, start/end times, counts, errors).
+extensions: Stores counts and percentages of file extensions found per crawl.
+discovered_items: (Optional) Stores individual file and directory paths found during crawls if --log-items was used.
+You can inspect this file using standard SQLite tools if needed.
